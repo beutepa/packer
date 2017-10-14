@@ -1,8 +1,8 @@
 package ovf
 
 import (
+	vboxcommon "github.com/hashicorp/packer/builder/virtualbox/common"
 	"github.com/mitchellh/multistep"
-	vboxcommon "github.com/mitchellh/packer/builder/virtualbox/common"
 	"testing"
 )
 
@@ -12,9 +12,12 @@ func TestStepImport_impl(t *testing.T) {
 
 func TestStepImport(t *testing.T) {
 	state := testState(t)
+	c := testConfig(t)
+	config, _, _ := NewConfig(c)
+	state.Put("vm_path", "foo")
+	state.Put("config", config)
 	step := new(StepImport)
 	step.Name = "bar"
-	step.SourcePath = "foo"
 
 	driver := state.Get("driver").(*vboxcommon.DriverMock)
 
@@ -33,9 +36,6 @@ func TestStepImport(t *testing.T) {
 	if driver.ImportName != step.Name {
 		t.Fatalf("bad: %#v", driver.ImportName)
 	}
-	if driver.ImportPath != step.SourcePath {
-		t.Fatalf("bad: %#v", driver.ImportPath)
-	}
 
 	// Test output state
 	if name, ok := state.GetOk("vmName"); !ok {
@@ -45,6 +45,14 @@ func TestStepImport(t *testing.T) {
 	}
 
 	// Test cleanup
+	config.KeepRegistered = true
+	step.Cleanup(state)
+
+	if driver.DeleteCalled {
+		t.Fatal("delete should not be called")
+	}
+
+	config.KeepRegistered = false
 	step.Cleanup(state)
 	if !driver.DeleteCalled {
 		t.Fatal("delete should be called")

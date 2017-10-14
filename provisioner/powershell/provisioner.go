@@ -1,10 +1,11 @@
 // This package implements a provisioner for Packer that executes
-// shell scripts within the remote machine.
+// powershell scripts within the remote machine.
 package powershell
 
 import (
 	"bufio"
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -14,14 +15,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
-
-const DefaultRemotePath = "c:/Windows/Temp/script.ps1"
 
 var retryableSleep = 2 * time.Second
 
@@ -36,7 +35,7 @@ type Config struct {
 	// in the context of a single shell.
 	Inline []string
 
-	// The local path of the shell script to upload and execute.
+	// The local path of the powershell script to upload and execute.
 	Script string
 
 	// An array of multiple scripts to run.
@@ -46,7 +45,7 @@ type Config struct {
 	// your command(s) are executed.
 	Vars []string `mapstructure:"environment_vars"`
 
-	// The remote path where the local shell script will be uploaded to.
+	// The remote path where the local powershell script will be uploaded to.
 	// This should be set to a writable file that is in a pre-existing directory.
 	RemotePath string `mapstructure:"remote_path"`
 
@@ -104,9 +103,11 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 		InterpolateFilter: &interpolate.RenderFilter{
 			Exclude: []string{
 				"execute_command",
+				"elevated_execute_command",
 			},
 		},
 	}, raws...)
+
 	if err != nil {
 		return err
 	}
@@ -120,11 +121,11 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 	}
 
 	if p.config.ExecuteCommand == "" {
-		p.config.ExecuteCommand = `powershell "& { {{.Vars}}{{.Path}}; exit $LastExitCode}"`
+		p.config.ExecuteCommand = `powershell -executionpolicy bypass "& { if (Test-Path variable:global:ProgressPreference){$ProgressPreference='SilentlyContinue'};{{.Vars}}&'{{.Path}}';exit $LastExitCode }"`
 	}
 
 	if p.config.ElevatedExecuteCommand == "" {
-		p.config.ElevatedExecuteCommand = `{{.Vars}}{{.Path}}`
+		p.config.ElevatedExecuteCommand = `powershell -executionpolicy bypass "& { if (Test-Path variable:global:ProgressPreference){$ProgressPreference='SilentlyContinue'};. {{.Vars}}; &'{{.Path}}'; exit $LastExitCode }"`
 	}
 
 	if p.config.Inline != nil && len(p.config.Inline) == 0 {
@@ -136,7 +137,8 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 	}
 
 	if p.config.RemotePath == "" {
-		p.config.RemotePath = DefaultRemotePath
+		uuid := uuid.TimeOrderedUUID()
+		p.config.RemotePath = fmt.Sprintf(`c:/Windows/Temp/script-%s.ps1`, uuid)
 	}
 
 	if p.config.Scripts == nil {
@@ -215,12 +217,12 @@ func extractScript(p *Provisioner) (string, error) {
 	for _, command := range p.config.Inline {
 		log.Printf("Found command: %s", command)
 		if _, err := writer.WriteString(command + "\n"); err != nil {
-			return "", fmt.Errorf("Error preparing shell script: %s", err)
+			return "", fmt.Errorf("Error preparing powershell script: %s", err)
 		}
 	}
 
 	if err := writer.Flush(); err != nil {
-		return "", fmt.Errorf("Error preparing shell script: %s", err)
+		return "", fmt.Errorf("Error preparing powershell script: %s", err)
 	}
 
 	return temp.Name(), nil
@@ -233,12 +235,6 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	scripts := make([]string, len(p.config.Scripts))
 	copy(scripts, p.config.Scripts)
 
-	// Build our variables up by adding in the build name and builder type
-	envVars := make([]string, len(p.config.Vars)+2)
-	envVars[0] = "PACKER_BUILD_NAME=" + p.config.PackerBuildName
-	envVars[1] = "PACKER_BUILDER_TYPE=" + p.config.PackerBuilderType
-	copy(envVars, p.config.Vars)
-
 	if p.config.Inline != nil {
 		temp, err := extractScript(p)
 		if err != nil {
@@ -248,12 +244,12 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	}
 
 	for _, path := range scripts {
-		ui.Say(fmt.Sprintf("Provisioning with shell script: %s", path))
+		ui.Say(fmt.Sprintf("Provisioning with powershell script: %s", path))
 
 		log.Printf("Opening %s for reading", path)
 		f, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("Error opening shell script: %s", err)
+			return fmt.Errorf("Error opening powershell script: %s", err)
 		}
 		defer f.Close()
 
@@ -272,7 +268,6 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 			if _, err := f.Seek(0, 0); err != nil {
 				return err
 			}
-
 			if err := comm.Upload(p.config.RemotePath, f, nil); err != nil {
 				return fmt.Errorf("Error uploading script: %s", err)
 			}
@@ -322,7 +317,7 @@ func (p *Provisioner) retryable(f func() error) error {
 
 		// Create an error and log it
 		err = fmt.Errorf("Retryable error: %s", err)
-		log.Printf(err.Error())
+		log.Print(err.Error())
 
 		// Check if we timed out, otherwise we retry. It is safe to
 		// retry since the only error case above is if the command
@@ -336,21 +331,21 @@ func (p *Provisioner) retryable(f func() error) error {
 	}
 }
 
-func (p *Provisioner) createFlattenedEnvVars(elevated bool) (flattened string, err error) {
+func (p *Provisioner) createFlattenedEnvVars(elevated bool) (flattened string) {
 	flattened = ""
 	envVars := make(map[string]string)
 
 	// Always available Packer provided env vars
 	envVars["PACKER_BUILD_NAME"] = p.config.PackerBuildName
 	envVars["PACKER_BUILDER_TYPE"] = p.config.PackerBuilderType
+	httpAddr := common.GetHTTPAddr()
+	if httpAddr != "" {
+		envVars["PACKER_HTTP_ADDR"] = httpAddr
+	}
 
 	// Split vars into key/value components
 	for _, envVar := range p.config.Vars {
-		keyValue := strings.Split(envVar, "=")
-		if len(keyValue) != 2 {
-			err = errors.New("Shell provisioner environment variables must be in key=value format")
-			return
-		}
+		keyValue := strings.SplitN(envVar, "=", 2)
 		envVars[keyValue[0]] = keyValue[1]
 	}
 
@@ -373,31 +368,49 @@ func (p *Provisioner) createFlattenedEnvVars(elevated bool) (flattened string, e
 }
 
 func (p *Provisioner) createCommandText() (command string, err error) {
-	// Create environment variables to set before executing the command
-	flattenedEnvVars, err := p.createFlattenedEnvVars(false)
-	if err != nil {
-		return "", err
+	// Return the interpolated command
+	if p.config.ElevatedUser == "" {
+		return p.createCommandTextNonPrivileged()
+	} else {
+		return p.createCommandTextPrivileged()
 	}
+}
+
+func (p *Provisioner) createCommandTextNonPrivileged() (command string, err error) {
+	// Create environment variables to set before executing the command
+	flattenedEnvVars := p.createFlattenedEnvVars(false)
 
 	p.config.ctx.Data = &ExecuteCommandTemplate{
 		Vars: flattenedEnvVars,
 		Path: p.config.RemotePath,
 	}
 	command, err = interpolate.Render(p.config.ExecuteCommand, &p.config.ctx)
+
 	if err != nil {
 		return "", fmt.Errorf("Error processing command: %s", err)
 	}
 
 	// Return the interpolated command
-	if p.config.ElevatedUser == "" {
-		return command, nil
+	return command, nil
+}
+
+func (p *Provisioner) createCommandTextPrivileged() (command string, err error) {
+	// Can't double escape the env vars, lets create shiny new ones
+	flattenedEnvVars := p.createFlattenedEnvVars(true)
+	// Need to create a mini ps1 script containing all of the environment variables we want;
+	// we'll be dot-sourcing this later
+	envVarReader := strings.NewReader(flattenedEnvVars)
+	uuid := uuid.TimeOrderedUUID()
+	envVarPath := fmt.Sprintf(`${env:SYSTEMROOT}\Temp\packer-env-vars-%s.ps1`, uuid)
+	log.Printf("Uploading env vars to %s", envVarPath)
+	err = p.communicator.Upload(envVarPath, envVarReader, nil)
+	if err != nil {
+		return "", fmt.Errorf("Error preparing elevated powershell script: %s", err)
 	}
 
-	// Can't double escape the env vars, lets create shiny new ones
-	flattenedEnvVars, err = p.createFlattenedEnvVars(true)
 	p.config.ctx.Data = &ExecuteCommandTemplate{
-		Vars: flattenedEnvVars,
 		Path: p.config.RemotePath,
+		Vars: envVarPath,
 	}
 	command, err = interpolate.Render(p.config.ElevatedExecuteCommand, &p.config.ctx)
 	if err != nil {
@@ -407,53 +420,67 @@ func (p *Provisioner) createCommandText() (command string, err error) {
 	// OK so we need an elevated shell runner to wrap our command, this is going to have its own path
 	// generate the script and update the command runner in the process
 	path, err := p.generateElevatedRunner(command)
+	if err != nil {
+		return "", fmt.Errorf("Error generating elevated runner: %s", err)
+	}
 
 	// Return the path to the elevated shell wrapper
 	command = fmt.Sprintf("powershell -executionpolicy bypass -file \"%s\"", path)
 
-	return
+	return command, err
 }
 
 func (p *Provisioner) generateElevatedRunner(command string) (uploadedPath string, err error) {
 	log.Printf("Building elevated command wrapper for: %s", command)
 
-	// generate command
 	var buffer bytes.Buffer
+
+	// Output from the elevated command cannot be returned directly to
+	// the Packer console. In order to be able to view output from elevated
+	// commands and scripts an indirect approach is used by which the
+	// commands output is first redirected to file. The output file is then
+	// 'watched' by Packer while the elevated command is running and any
+	// content appearing in the file is written out to the console.
+	// Below the portion of command required to redirect output from the
+	// command to file is built and appended to the existing command string
+	taskName := fmt.Sprintf("packer-%s", uuid.TimeOrderedUUID())
+	// Only use %ENVVAR% format for environment variables when setting
+	// the log file path; Do NOT use $env:ENVVAR format as it won't be
+	// expanded correctly in the elevatedTemplate
+	logFile := `%SYSTEMROOT%\Temp\` + taskName + ".out"
+	command += fmt.Sprintf(" > %s 2>&1", logFile)
+
+	// elevatedTemplate wraps the command in a single quoted XML text
+	// string so we need to escape characters considered 'special' in XML.
+	err = xml.EscapeText(&buffer, []byte(command))
+	if err != nil {
+		return "", fmt.Errorf("Error escaping characters special to XML in command %s: %s", command, err)
+	}
+	escapedCommand := buffer.String()
+	log.Printf("Command [%s] converted to [%s] for use in XML string", command, escapedCommand)
+
+	buffer.Reset()
+
+	// Generate command
 	err = elevatedTemplate.Execute(&buffer, elevatedOptions{
-		User:            p.config.ElevatedUser,
-		Password:        p.config.ElevatedPassword,
-		TaskDescription: "Packer elevated task",
-		TaskName:        fmt.Sprintf("packer-%s", uuid.TimeOrderedUUID()),
-		EncodedCommand:  powershellEncode([]byte(command + "; exit $LASTEXITCODE")),
+		User:              p.config.ElevatedUser,
+		Password:          p.config.ElevatedPassword,
+		TaskName:          taskName,
+		TaskDescription:   "Packer elevated task",
+		LogFile:           logFile,
+		XMLEscapedCommand: escapedCommand,
 	})
 
 	if err != nil {
 		fmt.Printf("Error creating elevated template: %s", err)
 		return "", err
 	}
-
-	tmpFile, err := ioutil.TempFile(os.TempDir(), "packer-elevated-shell.ps1")
-	writer := bufio.NewWriter(tmpFile)
-	if _, err := writer.WriteString(string(buffer.Bytes())); err != nil {
-		return "", fmt.Errorf("Error preparing elevated shell script: %s", err)
-	}
-
-	if err := writer.Flush(); err != nil {
-		return "", fmt.Errorf("Error preparing elevated shell script: %s", err)
-	}
-	tmpFile.Close()
-	f, err := os.Open(tmpFile.Name())
-	if err != nil {
-		return "", fmt.Errorf("Error opening temporary elevated shell script: %s", err)
-	}
-	defer f.Close()
-
 	uuid := uuid.TimeOrderedUUID()
 	path := fmt.Sprintf(`${env:TEMP}\packer-elevated-shell-%s.ps1`, uuid)
-	log.Printf("Uploading elevated shell wrapper for command [%s] to [%s] from [%s]", command, path, tmpFile.Name())
-	err = p.communicator.Upload(path, f, nil)
+	log.Printf("Uploading elevated shell wrapper for command [%s] to [%s]", command, path)
+	err = p.communicator.Upload(path, &buffer, nil)
 	if err != nil {
-		return "", fmt.Errorf("Error preparing elevated shell script: %s", err)
+		return "", fmt.Errorf("Error preparing elevated powershell script: %s", err)
 	}
 
 	// CMD formatted Path required for this op

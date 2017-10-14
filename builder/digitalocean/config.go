@@ -6,13 +6,13 @@ import (
 	"os"
 	"time"
 
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/mapstructure"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
 )
 
 type Config struct {
@@ -27,7 +27,9 @@ type Config struct {
 	Image  string `mapstructure:"image"`
 
 	PrivateNetworking bool          `mapstructure:"private_networking"`
+	Monitoring        bool          `mapstructure:"monitoring"`
 	SnapshotName      string        `mapstructure:"snapshot_name"`
+	SnapshotRegions   []string      `mapstructure:"snapshot_regions"`
 	StateTimeout      time.Duration `mapstructure:"state_timeout"`
 	DropletName       string        `mapstructure:"droplet_name"`
 	UserData          string        `mapstructure:"user_data"`
@@ -75,12 +77,6 @@ func NewConfig(raws ...interface{}) (*Config, []string, error) {
 	if c.DropletName == "" {
 		// Default to packer-[time-ordered-uuid]
 		c.DropletName = fmt.Sprintf("packer-%s", uuid.TimeOrderedUUID())
-	}
-
-	if c.Comm.SSHUsername == "" {
-		// Default to "root". You can override this if your
-		// SourceImage has a different user account then the DO default
-		c.Comm.SSHUsername = "root"
 	}
 
 	if c.StateTimeout == 0 {

@@ -6,11 +6,10 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/mitchellh/packer/builder/amazon/common"
-	builderT "github.com/mitchellh/packer/helper/builder/testing"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/builder/amazon/common"
+	builderT "github.com/hashicorp/packer/helper/builder/testing"
+	"github.com/hashicorp/packer/packer"
 )
 
 func TestBuilderAcc_basic(t *testing.T) {
@@ -44,6 +43,60 @@ func TestBuilderAcc_forceDeregister(t *testing.T) {
 		Builder:  &Builder{},
 		Template: buildForceDeregisterConfig("true", "dereg"),
 	})
+}
+
+func TestBuilderAcc_forceDeleteSnapshot(t *testing.T) {
+	amiName := "packer-test-dereg"
+
+	// Build the same AMI name twice, with force_delete_snapshot on the second run
+	builderT.Test(t, builderT.TestCase{
+		PreCheck:             func() { testAccPreCheck(t) },
+		Builder:              &Builder{},
+		Template:             buildForceDeleteSnapshotConfig("false", amiName),
+		SkipArtifactTeardown: true,
+	})
+
+	// Get image data by AMI name
+	ec2conn, _ := testEC2Conn()
+	imageResp, _ := ec2conn.DescribeImages(
+		&ec2.DescribeImagesInput{Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("name"),
+				Values: []*string{aws.String(amiName)},
+			},
+		}},
+	)
+	image := imageResp.Images[0]
+
+	// Get snapshot ids for image
+	snapshotIds := []*string{}
+	for _, device := range image.BlockDeviceMappings {
+		if device.Ebs != nil && device.Ebs.SnapshotId != nil {
+			snapshotIds = append(snapshotIds, device.Ebs.SnapshotId)
+		}
+	}
+
+	builderT.Test(t, builderT.TestCase{
+		PreCheck: func() { testAccPreCheck(t) },
+		Builder:  &Builder{},
+		Template: buildForceDeleteSnapshotConfig("true", amiName),
+		Check:    checkSnapshotsDeleted(snapshotIds),
+	})
+}
+
+func checkSnapshotsDeleted(snapshotIds []*string) builderT.TestCheckFunc {
+	return func(artifacts []packer.Artifact) error {
+		// Verify the snapshots are gone
+		ec2conn, _ := testEC2Conn()
+		snapshotResp, _ := ec2conn.DescribeSnapshots(
+			&ec2.DescribeSnapshotsInput{SnapshotIds: snapshotIds},
+		)
+
+		if len(snapshotResp.Snapshots) > 0 {
+			return fmt.Errorf("Snapshots weren't successfully deleted by `force_delete_snapshot`")
+		}
+		return nil
+	}
 }
 
 func TestBuilderAcc_amiSharing(t *testing.T) {
@@ -138,7 +191,7 @@ func checkRegionCopy(regions []string) builderT.TestCheckFunc {
 		for _, r := range regions {
 			regionSet[r] = struct{}{}
 		}
-		for r, _ := range artifact.Amis {
+		for r := range artifact.Amis {
 			if _, ok := regionSet[r]; !ok {
 				return fmt.Errorf("unknown region: %s", r)
 			}
@@ -201,12 +254,11 @@ func testAccPreCheck(t *testing.T) {
 
 func testEC2Conn() (*ec2.EC2, error) {
 	access := &common.AccessConfig{RawRegion: "us-east-1"}
-	config, err := access.Config()
+	session, err := access.Session()
 	if err != nil {
 		return nil, err
 	}
 
-	session := session.New(config)
 	return ec2.New(session), nil
 }
 
@@ -251,6 +303,21 @@ const testBuilderAccForceDeregister = `
 }
 `
 
+const testBuilderAccForceDeleteSnapshot = `
+{
+	"builders": [{
+		"type": "test",
+		"region": "us-east-1",
+		"instance_type": "m3.medium",
+		"source_ami": "ami-76b2a71e",
+		"ssh_username": "ubuntu",
+		"force_deregister": "%s",
+		"force_delete_snapshot": "%s",
+		"ami_name": "packer-test-%s"
+	}]
+}
+`
+
 // share with catsby
 const testBuilderAccSharing = `
 {
@@ -276,11 +343,15 @@ const testBuilderAccEncrypted = `
 		"source_ami":"ami-c15bebaa",
 		"ssh_username": "ubuntu",
 		"ami_name": "packer-enc-test {{timestamp}}",
-		"encrypt_boot": true 
+		"encrypt_boot": true
 	}]
 }
 `
 
-func buildForceDeregisterConfig(name, flag string) string {
-	return fmt.Sprintf(testBuilderAccForceDeregister, name, flag)
+func buildForceDeregisterConfig(val, name string) string {
+	return fmt.Sprintf(testBuilderAccForceDeregister, val, name)
+}
+
+func buildForceDeleteSnapshotConfig(val, name string) string {
+	return fmt.Sprintf(testBuilderAccForceDeleteSnapshot, val, val, name)
 }

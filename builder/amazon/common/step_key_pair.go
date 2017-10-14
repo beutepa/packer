@@ -7,25 +7,26 @@ import (
 	"runtime"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 type StepKeyPair struct {
 	Debug                bool
+	SSHAgentAuth         bool
 	DebugKeyPath         string
 	TemporaryKeyPairName string
 	KeyPairName          string
 	PrivateKeyFile       string
 
-	keyName string
+	doCleanup bool
 }
 
 func (s *StepKeyPair) Run(state multistep.StateBag) multistep.StepAction {
 	ui := state.Get("ui").(packer.Ui)
 
 	if s.PrivateKeyFile != "" {
-		ui.Say("Using existing ssh private key")
+		ui.Say("Using existing SSH private key")
 		privateKeyBytes, err := ioutil.ReadFile(s.PrivateKeyFile)
 		if err != nil {
 			state.Put("error", fmt.Errorf(
@@ -36,6 +37,17 @@ func (s *StepKeyPair) Run(state multistep.StateBag) multistep.StepAction {
 		state.Put("keyPair", s.KeyPairName)
 		state.Put("privateKey", string(privateKeyBytes))
 
+		return multistep.ActionContinue
+	}
+
+	if s.SSHAgentAuth && s.KeyPairName == "" {
+		ui.Say("Using SSH Agent with key pair in Source AMI")
+		return multistep.ActionContinue
+	}
+
+	if s.SSHAgentAuth && s.KeyPairName != "" {
+		ui.Say(fmt.Sprintf("Using SSH Agent for existing key pair %s", s.KeyPairName))
+		state.Put("keyPair", s.KeyPairName)
 		return multistep.ActionContinue
 	}
 
@@ -55,11 +67,10 @@ func (s *StepKeyPair) Run(state multistep.StateBag) multistep.StepAction {
 		return multistep.ActionHalt
 	}
 
-	// Set the keyname so we know to delete it later
-	s.keyName = s.TemporaryKeyPairName
+	s.doCleanup = true
 
 	// Set some state data for use in future steps
-	state.Put("keyPair", s.keyName)
+	state.Put("keyPair", s.TemporaryKeyPairName)
 	state.Put("privateKey", *keyResp.KeyMaterial)
 
 	// If we're in debug mode, output the private key to the working
@@ -92,10 +103,7 @@ func (s *StepKeyPair) Run(state multistep.StateBag) multistep.StepAction {
 }
 
 func (s *StepKeyPair) Cleanup(state multistep.StateBag) {
-	// If no key name is set, then we never created it, so just return
-	// If we used an SSH private key file, do not go about deleting
-	// keypairs
-	if s.PrivateKeyFile != "" || s.KeyPairName == "" {
+	if !s.doCleanup {
 		return
 	}
 
@@ -104,10 +112,10 @@ func (s *StepKeyPair) Cleanup(state multistep.StateBag) {
 
 	// Remove the keypair
 	ui.Say("Deleting temporary keypair...")
-	_, err := ec2conn.DeleteKeyPair(&ec2.DeleteKeyPairInput{KeyName: &s.keyName})
+	_, err := ec2conn.DeleteKeyPair(&ec2.DeleteKeyPairInput{KeyName: &s.TemporaryKeyPairName})
 	if err != nil {
 		ui.Error(fmt.Sprintf(
-			"Error cleaning up keypair. Please delete the key manually: %s", s.keyName))
+			"Error cleaning up keypair. Please delete the key manually: %s", s.TemporaryKeyPairName))
 	}
 
 	// Also remove the physical key if we're debugging.

@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 )
 
 var testPem = `
@@ -301,11 +301,11 @@ func TestBuilderPrepare_FloppyFiles(t *testing.T) {
 func TestBuilderPrepare_InvalidFloppies(t *testing.T) {
 	var b Builder
 	config := testConfig()
-	config["floppy_files"] = []string{"nonexistant.bat", "nonexistant.ps1"}
+	config["floppy_files"] = []string{"nonexistent.bat", "nonexistent.ps1"}
 	b = Builder{}
 	_, errs := b.Prepare(config)
 	if errs == nil {
-		t.Fatalf("Non existant floppies should trigger multierror")
+		t.Fatalf("Nonexistent floppies should trigger multierror")
 	}
 
 	if len(errs.(*packer.MultiError).Errors) != 2 {
@@ -488,31 +488,6 @@ func TestBuilderPrepare_SSHPrivateKey(t *testing.T) {
 	}
 }
 
-func TestBuilderPrepare_SSHUser(t *testing.T) {
-	var b Builder
-	config := testConfig()
-
-	config["ssh_username"] = ""
-	b = Builder{}
-	warns, err := b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	config["ssh_username"] = "exists"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
-	}
-}
-
 func TestBuilderPrepare_SSHWaitTimeout(t *testing.T) {
 	var b Builder
 	config := testConfig()
@@ -570,7 +545,7 @@ func TestBuilderPrepare_QemuArgs(t *testing.T) {
 
 	// Test with a good one
 	config["qemuargs"] = [][]interface{}{
-		[]interface{}{"foo", "bar", "baz"},
+		{"foo", "bar", "baz"},
 	}
 
 	b = Builder{}
@@ -583,7 +558,7 @@ func TestBuilderPrepare_QemuArgs(t *testing.T) {
 	}
 
 	expected := [][]string{
-		[]string{"foo", "bar", "baz"},
+		{"foo", "bar", "baz"},
 	}
 
 	if !reflect.DeepEqual(b.config.QemuArgs, expected) {

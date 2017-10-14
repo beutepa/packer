@@ -2,9 +2,9 @@ package iso
 
 import (
 	"fmt"
+	vboxcommon "github.com/hashicorp/packer/builder/virtualbox/common"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	vboxcommon "github.com/mitchellh/packer/builder/virtualbox/common"
-	"github.com/mitchellh/packer/packer"
 	"time"
 )
 
@@ -76,7 +76,7 @@ func (s *stepCreateVM) Cleanup(state multistep.StateBag) {
 	ui.Say("Unregistering and deleting virtual machine...")
 	var err error = nil
 	for i := 0; i < 5; i++ {
-		err = driver.VBoxManage("unregistervm", s.vmName, "--delete")
+		err = driver.Delete(s.vmName)
 		if err == nil {
 			break
 		}

@@ -10,6 +10,7 @@
 test/.env
 *~
 *.received.*
+*.swp
 
 website/.bundle
 website/vendor
@@ -18,3 +19,8 @@ packer-test*.log
 
 *.received.txt
 *.received.json
+
+.idea/
+*.iml
+Thumbs.db
+/packer.exe

@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -46,8 +46,8 @@ type Config struct {
 	// Pty, if true, will request a pty from the remote end.
 	Pty bool
 
-	// DisableAgent, if true, will not forward the SSH agent.
-	DisableAgent bool
+	// DisableAgentForwarding, if true, will not forward the SSH agent.
+	DisableAgentForwarding bool
 
 	// HandshakeTimeout limits the amount of time we'll wait to handshake before
 	// saying the connection failed.
@@ -118,15 +118,13 @@ func (c *comm) Start(cmd *packer.RemoteCmd) (err error) {
 				log.Printf("Remote command exited with '%d': %s", exitStatus, cmd.Command)
 			case *ssh.ExitMissingError:
 				log.Printf("Remote command exited without exit status or exit signal.")
-				exitStatus = -1
+				exitStatus = packer.CmdDisconnect
 			default:
 				log.Printf("Error occurred waiting for ssh session: %s", err.Error())
-				exitStatus = -1
 			}
 		}
 		cmd.SetExited(exitStatus)
 	}()
-
 	return
 }
 
@@ -166,12 +164,12 @@ func (c *comm) DownloadDir(src string, dst string, excl []string) error {
 
 			switch fi[0] {
 			case '\x01', '\x02':
-				return fmt.Errorf("%s", fi[1:len(fi)])
+				return fmt.Errorf("%s", fi[1:])
 			case 'C', 'D':
 				break
 			case 'E':
 				dirStack = dirStack[:len(dirStack)-1]
-				if len(dirStack) == 1 {
+				if len(dirStack) == 0 {
 					fmt.Fprint(w, "\x00")
 					return nil
 				}
@@ -180,11 +178,11 @@ func (c *comm) DownloadDir(src string, dst string, excl []string) error {
 				return fmt.Errorf("unexpected server response (%x)", fi[0])
 			}
 
-			var mode string
+			var mode int64
 			var size int64
 			var name string
 			log.Printf("Download dir str:%s", fi)
-			n, err := fmt.Sscanf(fi, "%6s %d %s", &mode, &size, &name)
+			n, err := fmt.Sscanf(fi[1:], "%o %d %s", &mode, &size, &name)
 			if err != nil || n != 3 {
 				return fmt.Errorf("can't parse server response (%s)", fi)
 			}
@@ -192,12 +190,12 @@ func (c *comm) DownloadDir(src string, dst string, excl []string) error {
 				return fmt.Errorf("negative file size")
 			}
 
-			log.Printf("Download dir mode:%s size:%d name:%s", mode, size, name)
+			log.Printf("Download dir mode:%0o size:%d name:%s", mode, size, name)
 
 			dst = filepath.Join(dirStack...)
 			switch fi[0] {
 			case 'D':
-				err = os.MkdirAll(filepath.Join(dst, name), os.FileMode(0755))
+				err = os.MkdirAll(filepath.Join(dst, name), os.FileMode(mode))
 				if err != nil {
 					return err
 				}
@@ -205,7 +203,7 @@ func (c *comm) DownloadDir(src string, dst string, excl []string) error {
 				continue
 			case 'C':
 				fmt.Fprint(w, "\x00")
-				err = scpDownloadFile(filepath.Join(dst, name), stdoutR, size, os.FileMode(0644))
+				err = scpDownloadFile(filepath.Join(dst, name), stdoutR, size, os.FileMode(mode))
 				if err != nil {
 					return err
 				}
@@ -240,7 +238,11 @@ func (c *comm) newSession() (session *ssh.Session, err error) {
 			return nil, err
 		}
 
-		return c.client.NewSession()
+		if c.client == nil {
+			return nil, errors.New("client not available")
+		} else {
+			return c.client.NewSession()
+		}
 	}
 
 	return session, nil
@@ -248,6 +250,7 @@ func (c *comm) newSession() (session *ssh.Session, err error) {
 
 func (c *comm) reconnect() (err error) {
 	if c.conn != nil {
+		// Ignore errors here because we don't care if it fails
 		c.conn.Close()
 	}
 
@@ -324,7 +327,7 @@ func (c *comm) connectToAgent() {
 		return
 	}
 
-	if c.config.DisableAgent {
+	if c.config.DisableAgentForwarding {
 		log.Printf("[INFO] SSH agent forwarding is disabled.")
 		return
 	}
@@ -591,7 +594,7 @@ func (c *comm) scpDownloadSession(path string, output io.Writer) error {
 
 		switch fi[0] {
 		case '\x01', '\x02':
-			return fmt.Errorf("%s", fi[1:len(fi)])
+			return fmt.Errorf("%s", fi[1:])
 		case 'C':
 		case 'D':
 			return fmt.Errorf("remote file is directory")
@@ -618,14 +621,10 @@ func (c *comm) scpDownloadSession(path string, output io.Writer) error {
 
 		fmt.Fprint(w, "\x00")
 
-		if err := checkSCPStatus(stdoutR); err != nil {
-			return err
-		}
-
-		return nil
+		return checkSCPStatus(stdoutR)
 	}
 
-	if strings.Index(path, " ") == -1 {
+	if !strings.Contains(path, " ") {
 		return c.scpSession("scp -vf "+path, scpFunc)
 	}
 	return c.scpSession("scp -vf "+strconv.Quote(path), scpFunc)
@@ -694,6 +693,11 @@ func (c *comm) scpSession(scpCommand string, f func(io.Writer, *bufio.Reader) er
 			// Otherwise, we have an ExitErorr, meaning we can just read
 			// the exit status
 			log.Printf("non-zero exit status: %d", exitErr.ExitStatus())
+			stdoutB, err := ioutil.ReadAll(stdoutR)
+			if err != nil {
+				return err
+			}
+			log.Printf("scp output: %s", stdoutB)
 
 			// If we exited with status 127, it means SCP isn't available.
 			// Return a more descriptive error for that.
@@ -803,11 +807,7 @@ func scpUploadFile(dst string, src io.Reader, w io.Writer, r *bufio.Reader, fi *
 	}
 
 	fmt.Fprint(w, "\x00")
-	if err := checkSCPStatus(r); err != nil {
-		return err
-	}
-
-	return nil
+	return checkSCPStatus(r)
 }
 
 func scpUploadDirProtocol(name string, w io.Writer, r *bufio.Reader, f func() error, fi os.FileInfo) error {
@@ -828,11 +828,7 @@ func scpUploadDirProtocol(name string, w io.Writer, r *bufio.Reader, f func() er
 	}
 
 	fmt.Fprintln(w, "E")
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func scpUploadDir(root string, fs []os.FileInfo, w io.Writer, r *bufio.Reader) error {

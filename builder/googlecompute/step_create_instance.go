@@ -6,8 +6,8 @@ import (
 	"io/ioutil"
 	"time"
 
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 // StepCreateInstance represents a Packer build step that creates GCE instances.
@@ -24,13 +24,17 @@ func (c *Config) createInstanceMetadata(sourceImage *Image, sshPublicKey string)
 		instanceMetadata[k] = v
 	}
 
-	// Merge any existing ssh keys with our public key.
-	sshMetaKey := "sshKeys"
-	sshKeys := fmt.Sprintf("%s:%s", c.Comm.SSHUsername, sshPublicKey)
-	if confSshKeys, exists := instanceMetadata[sshMetaKey]; exists {
-		sshKeys = fmt.Sprintf("%s\n%s", sshKeys, confSshKeys)
+	// Merge any existing ssh keys with our public key, unless there is no
+	// supplied public key. This is possible if a private_key_file was
+	// specified.
+	if sshPublicKey != "" {
+		sshMetaKey := "sshKeys"
+		sshKeys := fmt.Sprintf("%s:%s", c.Comm.SSHUsername, sshPublicKey)
+		if confSshKeys, exists := instanceMetadata[sshMetaKey]; exists {
+			sshKeys = fmt.Sprintf("%s\n%s", sshKeys, confSshKeys)
+		}
+		instanceMetadata[sshMetaKey] = sshKeys
 	}
-	instanceMetadata[sshMetaKey] = sshKeys
 
 	// Wrap any startup script with our own startup script.
 	if c.StartupScriptFile != "" {
@@ -54,10 +58,16 @@ func (c *Config) createInstanceMetadata(sourceImage *Image, sshPublicKey string)
 }
 
 func getImage(c *Config, d Driver) (*Image, error) {
+	name := c.SourceImageFamily
+	fromFamily := true
+	if c.SourceImage != "" {
+		name = c.SourceImage
+		fromFamily = false
+	}
 	if c.SourceImageProjectId == "" {
-		return d.GetImage(c.SourceImage)
+		return d.GetImage(name, fromFamily)
 	} else {
-		return d.GetImageFromProject(c.SourceImageProjectId, c.SourceImage)
+		return d.GetImageFromProject(c.SourceImageProjectId, name, fromFamily)
 	}
 }
 
@@ -76,6 +86,8 @@ func (s *StepCreateInstance) Run(state multistep.StateBag) multistep.StepAction 
 		return multistep.ActionHalt
 	}
 
+	ui.Say(fmt.Sprintf("Using image: %s", sourceImage.Name))
+
 	if sourceImage.IsWindows() && c.Comm.Type == "winrm" && c.Comm.WinRMPassword == "" {
 		state.Put("create_windows_password", true)
 	}
@@ -87,22 +99,27 @@ func (s *StepCreateInstance) Run(state multistep.StateBag) multistep.StepAction 
 	var metadata map[string]string
 	metadata, err = c.createInstanceMetadata(sourceImage, sshPublicKey)
 	errCh, err = d.RunInstance(&InstanceConfig{
-		Address:             c.Address,
-		Description:         "New instance created by Packer",
-		DiskSizeGb:          c.DiskSizeGb,
-		DiskType:            c.DiskType,
-		Image:               sourceImage,
-		MachineType:         c.MachineType,
-		Metadata:            metadata,
-		Name:                name,
-		Network:             c.Network,
-		OmitExternalIP:      c.OmitExternalIP,
-		Preemptible:         c.Preemptible,
-		Region:              c.Region,
-		ServiceAccountEmail: c.Account.ClientEmail,
-		Subnetwork:          c.Subnetwork,
-		Tags:                c.Tags,
-		Zone:                c.Zone,
+		AcceleratorType:   c.AcceleratorType,
+		AcceleratorCount:  c.AcceleratorCount,
+		Address:           c.Address,
+		Description:       "New instance created by Packer",
+		DiskSizeGb:        c.DiskSizeGb,
+		DiskType:          c.DiskType,
+		Image:             sourceImage,
+		Labels:            c.Labels,
+		MachineType:       c.MachineType,
+		Metadata:          metadata,
+		Name:              name,
+		Network:           c.Network,
+		NetworkProjectId:  c.NetworkProjectId,
+		OmitExternalIP:    c.OmitExternalIP,
+		OnHostMaintenance: c.OnHostMaintenance,
+		Preemptible:       c.Preemptible,
+		Region:            c.Region,
+		Scopes:            c.Scopes,
+		Subnetwork:        c.Subnetwork,
+		Tags:              c.Tags,
+		Zone:              c.Zone,
 	})
 
 	if err == nil {

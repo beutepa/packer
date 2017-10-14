@@ -10,18 +10,20 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/version"
+	"google.golang.org/api/compute/v1"
+
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/version"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"golang.org/x/oauth2/jwt"
-	"google.golang.org/api/compute/v1"
 )
 
 // driverGCE is a Driver implementation that actually talks to GCE.
@@ -96,11 +98,12 @@ func NewDriverGCE(ui packer.Ui, p string, a *AccountFile) (Driver, error) {
 	}, nil
 }
 
-func (d *driverGCE) CreateImage(name, description, family, zone, disk string) (<-chan *Image, <-chan error) {
+func (d *driverGCE) CreateImage(name, description, family, zone, disk string, image_labels map[string]string) (<-chan *Image, <-chan error) {
 	gce_image := &compute.Image{
 		Description: description,
 		Name:        name,
 		Family:      family,
+		Labels:      image_labels,
 		SourceDisk:  fmt.Sprintf("%s%s/zones/%s/disks/%s", d.service.BasePath, d.projectId, zone, disk),
 		SourceType:  "RAW",
 	}
@@ -119,7 +122,7 @@ func (d *driverGCE) CreateImage(name, description, family, zone, disk string) (<
 				return
 			}
 			var image *Image
-			image, err = d.GetImageFromProject(d.projectId, name)
+			image, err = d.GetImageFromProject(d.projectId, name, false)
 			if err != nil {
 				close(imageCh)
 				errCh <- err
@@ -167,11 +170,11 @@ func (d *driverGCE) DeleteDisk(zone, name string) (<-chan error, error) {
 	return errCh, nil
 }
 
-func (d *driverGCE) GetImage(name string) (*Image, error) {
+func (d *driverGCE) GetImage(name string, fromFamily bool) (*Image, error) {
 	projects := []string{d.projectId, "centos-cloud", "coreos-cloud", "debian-cloud", "google-containers", "opensuse-cloud", "rhel-cloud", "suse-cloud", "ubuntu-os-cloud", "windows-cloud", "gce-nvme"}
 	var errs error
 	for _, project := range projects {
-		image, err := d.GetImageFromProject(project, name)
+		image, err := d.GetImageFromProject(project, name, fromFamily)
 		if err != nil {
 			errs = packer.MultiErrorAppend(errs, err)
 		}
@@ -185,8 +188,17 @@ func (d *driverGCE) GetImage(name string) (*Image, error) {
 		projects, errs)
 }
 
-func (d *driverGCE) GetImageFromProject(project, name string) (*Image, error) {
-	image, err := d.service.Images.Get(project, name).Do()
+func (d *driverGCE) GetImageFromProject(project, name string, fromFamily bool) (*Image, error) {
+	var (
+		image *compute.Image
+		err   error
+	)
+
+	if fromFamily {
+		image, err = d.service.Images.GetFromFamily(project, name).Do()
+	} else {
+		image, err = d.service.Images.Get(project, name).Do()
+	}
 
 	if err != nil {
 		return nil, err
@@ -264,7 +276,7 @@ func (d *driverGCE) GetSerialPortOutput(zone, name string) (string, error) {
 }
 
 func (d *driverGCE) ImageExists(name string) bool {
-	_, err := d.GetImageFromProject(d.projectId, name)
+	_, err := d.GetImageFromProject(d.projectId, name, false)
 	// The API may return an error for reasons other than the image not
 	// existing, but this heuristic is sufficient for now.
 	return err == nil
@@ -287,30 +299,56 @@ func (d *driverGCE) RunInstance(c *InstanceConfig) (<-chan error, error) {
 	}
 	// TODO(mitchellh): deprecation warnings
 
-	// Get the network
-	d.ui.Message(fmt.Sprintf("Loading network: %s", c.Network))
-	network, err := d.service.Networks.Get(d.projectId, c.Network).Do()
-	if err != nil {
-		return nil, err
-	}
+	networkSelfLink := ""
+	subnetworkSelfLink := ""
 
-	// Subnetwork
-	// Validate Subnetwork config now that we have some info about the network
-	if !network.AutoCreateSubnetworks && len(network.Subnetworks) > 0 {
-		// Network appears to be in "custom" mode, so a subnetwork is required
-		if c.Subnetwork == "" {
-			return nil, fmt.Errorf("a subnetwork must be specified")
+	if u, err := url.Parse(c.Network); err == nil && (u.Scheme == "https" || u.Scheme == "http") {
+		// Network is a full server URL
+		// Parse out Network and NetworkProjectId from URL
+		// https://www.googleapis.com/compute/v1/projects/<ProjectId>/global/networks/<Network>
+		networkSelfLink = c.Network
+		parts := strings.Split(u.String(), "/")
+		if len(parts) >= 10 {
+			c.NetworkProjectId = parts[6]
+			c.Network = parts[9]
 		}
 	}
-	// Get the subnetwork
-	subnetworkSelfLink := ""
-	if c.Subnetwork != "" {
-		d.ui.Message(fmt.Sprintf("Loading subnetwork: %s for region: %s", c.Subnetwork, c.Region))
-		subnetwork, err := d.service.Subnetworks.Get(d.projectId, c.Region, c.Subnetwork).Do()
+	if u, err := url.Parse(c.Subnetwork); err == nil && (u.Scheme == "https" || u.Scheme == "http") {
+		// Subnetwork is a full server URL
+		subnetworkSelfLink = c.Subnetwork
+	}
+
+	// If subnetwork is ID's and not full service URL's look them up.
+	if subnetworkSelfLink == "" {
+
+		// Get the network
+		if c.NetworkProjectId == "" {
+			c.NetworkProjectId = d.projectId
+		}
+		d.ui.Message(fmt.Sprintf("Loading network: %s", c.Network))
+		network, err := d.service.Networks.Get(c.NetworkProjectId, c.Network).Do()
 		if err != nil {
 			return nil, err
 		}
-		subnetworkSelfLink = subnetwork.SelfLink
+		networkSelfLink = network.SelfLink
+
+		// Subnetwork
+		// Validate Subnetwork config now that we have some info about the network
+		if !network.AutoCreateSubnetworks && len(network.Subnetworks) > 0 {
+			// Network appears to be in "custom" mode, so a subnetwork is required
+			if c.Subnetwork == "" {
+				return nil, fmt.Errorf("a subnetwork must be specified")
+			}
+		}
+		// Get the subnetwork
+		if c.Subnetwork != "" {
+			d.ui.Message(fmt.Sprintf("Loading subnetwork: %s for region: %s", c.Subnetwork, c.Region))
+			subnetwork, err := d.service.Subnetworks.Get(c.NetworkProjectId, c.Region, c.Subnetwork).Do()
+			if err != nil {
+				return nil, err
+			}
+			subnetworkSelfLink = subnetwork.SelfLink
+		}
 	}
 
 	var accessconfig *compute.AccessConfig
@@ -343,11 +381,20 @@ func (d *driverGCE) RunInstance(c *InstanceConfig) (<-chan error, error) {
 		})
 	}
 
+	var guestAccelerators []*compute.AcceleratorConfig
+	if c.AcceleratorCount > 0 {
+		ac := &compute.AcceleratorConfig{
+			AcceleratorCount: c.AcceleratorCount,
+			AcceleratorType:  c.AcceleratorType,
+		}
+		guestAccelerators = append(guestAccelerators, ac)
+	}
+
 	// Create the instance information
 	instance := compute.Instance{
 		Description: c.Description,
 		Disks: []*compute.AttachedDisk{
-			&compute.AttachedDisk{
+			{
 				Type:       "PERSISTENT",
 				Mode:       "READ_WRITE",
 				Kind:       "compute#attachedDisk",
@@ -360,29 +407,28 @@ func (d *driverGCE) RunInstance(c *InstanceConfig) (<-chan error, error) {
 				},
 			},
 		},
-		MachineType: machineType.SelfLink,
+		GuestAccelerators: guestAccelerators,
+		Labels:            c.Labels,
+		MachineType:       machineType.SelfLink,
 		Metadata: &compute.Metadata{
 			Items: metadata,
 		},
 		Name: c.Name,
 		NetworkInterfaces: []*compute.NetworkInterface{
-			&compute.NetworkInterface{
+			{
 				AccessConfigs: []*compute.AccessConfig{accessconfig},
-				Network:       network.SelfLink,
+				Network:       networkSelfLink,
 				Subnetwork:    subnetworkSelfLink,
 			},
 		},
 		Scheduling: &compute.Scheduling{
-			Preemptible: c.Preemptible,
+			OnHostMaintenance: c.OnHostMaintenance,
+			Preemptible:       c.Preemptible,
 		},
 		ServiceAccounts: []*compute.ServiceAccount{
-			&compute.ServiceAccount{
-				Email: c.ServiceAccountEmail,
-				Scopes: []string{
-					"https://www.googleapis.com/auth/userinfo.email",
-					"https://www.googleapis.com/auth/compute",
-					"https://www.googleapis.com/auth/devstorage.full_control",
-				},
+			{
+				Email:  "default",
+				Scopes: c.Scopes,
 			},
 		},
 		Tags: &compute.Tags{
@@ -572,7 +618,7 @@ type stateRefreshFunc func() (string, error)
 // waitForState will spin in a loop forever waiting for state to
 // reach a certain target.
 func waitForState(errCh chan<- error, target string, refresh stateRefreshFunc) error {
-	err := common.Retry(2, 2, 0, func() (bool, error) {
+	err := common.Retry(2, 2, 0, func(_ uint) (bool, error) {
 		state, err := refresh()
 		if err != nil {
 			return false, err

@@ -3,16 +3,27 @@ package common
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"time"
 
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 var reShutdownBehavior = regexp.MustCompile("^(stop|terminate)$")
+
+type AmiFilterOptions struct {
+	Filters    map[*string]*string
+	Owners     []*string
+	MostRecent bool `mapstructure:"most_recent"`
+}
+
+func (d *AmiFilterOptions) Empty() bool {
+	return len(d.Owners) == 0 && len(d.Filters) == 0
+}
 
 // RunConfig contains configuration for running an instance from a source
 // AMI and details on how to access that launched image.
@@ -24,18 +35,20 @@ type RunConfig struct {
 	InstanceType                      string            `mapstructure:"instance_type"`
 	RunTags                           map[string]string `mapstructure:"run_tags"`
 	SourceAmi                         string            `mapstructure:"source_ami"`
+	SourceAmiFilter                   AmiFilterOptions  `mapstructure:"source_ami_filter"`
 	SpotPrice                         string            `mapstructure:"spot_price"`
 	SpotPriceAutoProduct              string            `mapstructure:"spot_price_auto_product"`
 	DisableStopInstance               bool              `mapstructure:"disable_stop_instance"`
 	SecurityGroupId                   string            `mapstructure:"security_group_id"`
 	SecurityGroupIds                  []string          `mapstructure:"security_group_ids"`
+	TemporarySGSourceCidr             string            `mapstructure:"temporary_security_group_source_cidr"`
 	SubnetId                          string            `mapstructure:"subnet_id"`
 	TemporaryKeyPairName              string            `mapstructure:"temporary_key_pair_name"`
 	UserData                          string            `mapstructure:"user_data"`
 	UserDataFile                      string            `mapstructure:"user_data_file"`
 	WindowsPasswordTimeout            time.Duration     `mapstructure:"windows_password_timeout"`
 	VpcId                             string            `mapstructure:"vpc_id"`
-	InstanceInitiatedShutdownBehavior string            `mapstructure:"shutdown_behaviour"`
+	InstanceInitiatedShutdownBehavior string            `mapstructure:"shutdown_behavior"`
 
 	// Communicator settings
 	Comm           communicator.Config `mapstructure:",squash"`
@@ -55,13 +68,25 @@ func (c *RunConfig) Prepare(ctx *interpolate.Context) []error {
 	}
 
 	if c.WindowsPasswordTimeout == 0 {
-		c.WindowsPasswordTimeout = 10 * time.Minute
+		c.WindowsPasswordTimeout = 20 * time.Minute
+	}
+
+	if c.RunTags == nil {
+		c.RunTags = make(map[string]string)
 	}
 
 	// Validation
 	errs := c.Comm.Prepare(ctx)
-	if c.SourceAmi == "" {
-		errs = append(errs, errors.New("A source_ami must be specified"))
+	if c.SSHKeyPairName != "" {
+		if c.Comm.Type == "winrm" && c.Comm.WinRMPassword == "" && c.Comm.SSHPrivateKey == "" {
+			errs = append(errs, errors.New("A private_key_file must be provided to retrieve the winrm password when using ssh_keypair_name."))
+		} else if c.Comm.SSHPrivateKey == "" && !c.Comm.SSHAgentAuth {
+			errs = append(errs, errors.New("A private_key_file must be provided or ssh_agent_auth enabled when ssh_keypair_name is specified."))
+		}
+	}
+
+	if c.SourceAmi == "" && c.SourceAmiFilter.Empty() {
+		errs = append(errs, errors.New("A source_ami or source_ami_filter must be specified"))
 	}
 
 	if c.InstanceType == "" {
@@ -92,10 +117,18 @@ func (c *RunConfig) Prepare(ctx *interpolate.Context) []error {
 		}
 	}
 
+	if c.TemporarySGSourceCidr == "" {
+		c.TemporarySGSourceCidr = "0.0.0.0/0"
+	} else {
+		if _, _, err := net.ParseCIDR(c.TemporarySGSourceCidr); err != nil {
+			errs = append(errs, fmt.Errorf("Error parsing temporary_security_group_source_cidr: %s", err.Error()))
+		}
+	}
+
 	if c.InstanceInitiatedShutdownBehavior == "" {
 		c.InstanceInitiatedShutdownBehavior = "stop"
 	} else if !reShutdownBehavior.MatchString(c.InstanceInitiatedShutdownBehavior) {
-		errs = append(errs, fmt.Errorf("shutdown_behaviour only accepts 'stop' or 'terminate' values."))
+		errs = append(errs, fmt.Errorf("shutdown_behavior only accepts 'stop' or 'terminate' values."))
 	}
 
 	return errs

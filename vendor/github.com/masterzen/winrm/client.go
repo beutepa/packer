@@ -2,11 +2,10 @@ package winrm
 
 import (
 	"bytes"
-	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
-	"net/http"
+	"sync"
 
 	"github.com/masterzen/winrm/soap"
 )
@@ -14,12 +13,19 @@ import (
 // Client struct
 type Client struct {
 	Parameters
-	username  string
-	password  string
-	useHTTPS  bool
-	url       string
-	http      HttpPost
-	transport http.RoundTripper
+	username string
+	password string
+	useHTTPS bool
+	url      string
+	http     Transporter
+}
+
+// Transporter does different transporters
+// and init a Post request based on them
+type Transporter interface {
+	// init request baset on the transport configurations
+	Post(*Client, *soap.SoapMessage) (string, error)
+	Transport(*Endpoint) error
 }
 
 // NewClient will create a new remote client on url, connecting with user and password
@@ -31,46 +37,29 @@ func NewClient(endpoint *Endpoint, user, password string) (*Client, error) {
 // NewClientWithParameters will create a new remote client on url, connecting with user and password
 // This function doesn't connect (connection happens only when CreateShell is called)
 func NewClientWithParameters(endpoint *Endpoint, user, password string, params *Parameters) (*Client, error) {
-	transport, err := newTransport(endpoint)
 
+	// alloc a new client
 	client := &Client{
 		Parameters: *params,
 		username:   user,
 		password:   password,
 		url:        endpoint.url(),
-		http:       PostRequest,
 		useHTTPS:   endpoint.HTTPS,
-		transport:  transport,
+		// default transport
+		http: &clientRequest{},
 	}
 
+	// switch to other transport if provided
 	if params.TransportDecorator != nil {
-		client.transport = params.TransportDecorator(transport)
+		client.http = params.TransportDecorator()
 	}
 
-	return client, err
-}
-
-// newTransport will create a new HTTP Transport,
-// with options specified within the endpoint configuration
-func newTransport(endpoint *Endpoint) (*http.Transport, error) {
-
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: endpoint.Insecure,
-		},
-		ResponseHeaderTimeout: endpoint.Timeout,
+	// set the transport to some endpoint configuration
+	if err := client.http.Transport(endpoint); err != nil {
+		return nil, fmt.Errorf("Can't parse this key and certs: %s", err)
 	}
 
-	if endpoint.CACert != nil && len(endpoint.CACert) > 0 {
-		certPool, err := readCACerts(endpoint.CACert)
-		if err != nil {
-			return nil, err
-		}
-
-		transport.TLSClientConfig.RootCAs = certPool
-	}
-
-	return transport, nil
+	return client, nil
 }
 
 func readCACerts(certs []byte) (*x509.CertPool, error) {
@@ -110,7 +99,7 @@ func (c *Client) NewShell(id string) *Shell {
 
 // sendRequest exec the custom http func from the client
 func (c *Client) sendRequest(request *soap.SoapMessage) (string, error) {
-	return c.http(c, request)
+	return c.http.Post(c, request)
 }
 
 // Run will run command on the the remote host, writing the process stdout and stderr to
@@ -126,10 +115,21 @@ func (c *Client) Run(command string, stdout io.Writer, stderr io.Writer) (int, e
 		return 1, err
 	}
 
-	go io.Copy(stdout, cmd.Stdout)
-	go io.Copy(stderr, cmd.Stderr)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		io.Copy(stdout, cmd.Stdout)
+	}()
+
+	go func() {
+		defer wg.Done()
+		io.Copy(stderr, cmd.Stderr)
+	}()
 
 	cmd.Wait()
+	wg.Wait()
 
 	return cmd.ExitCode(), cmd.err
 }
@@ -183,4 +183,5 @@ func (c Client) RunWithInput(command string, stdout, stderr io.Writer, stdin io.
 	cmd.Wait()
 
 	return cmd.ExitCode(), cmd.err
+
 }

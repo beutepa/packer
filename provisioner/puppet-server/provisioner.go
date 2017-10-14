@@ -1,4 +1,4 @@
-// This package implements a provisioner for Packer that executes
+// Package puppetserver implements a provisioner for Packer that executes
 // Puppet on the remote machine connecting to a Puppet master.
 package puppetserver
 
@@ -7,11 +7,50 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/provisioner"
+	"github.com/hashicorp/packer/template/interpolate"
 )
+
+type guestOSTypeConfig struct {
+	executeCommand   string
+	facterVarsFmt    string
+	facterVarsJoiner string
+	stagingDir       string
+}
+
+var guestOSTypeConfigs = map[string]guestOSTypeConfig{
+	provisioner.UnixOSType: {
+		executeCommand: "{{.FacterVars}} {{if .Sudo}}sudo -E {{end}}" +
+			"{{if ne .PuppetBinDir \"\"}}{{.PuppetBinDir}}/{{end}}puppet agent " +
+			"--onetime --no-daemonize " +
+			"{{if ne .PuppetServer \"\"}}--server='{{.PuppetServer}}' {{end}}" +
+			"{{if ne .Options \"\"}}{{.Options}} {{end}}" +
+			"{{if ne .PuppetNode \"\"}}--certname={{.PuppetNode}} {{end}}" +
+			"{{if ne .ClientCertPath \"\"}}--certdir='{{.ClientCertPath}}' {{end}}" +
+			"{{if ne .ClientPrivateKeyPath \"\"}}--privatekeydir='{{.ClientPrivateKeyPath}}' {{end}}" +
+			"--detailed-exitcodes",
+		facterVarsFmt:    "FACTER_%s='%s'",
+		facterVarsJoiner: " ",
+		stagingDir:       "/tmp/packer-puppet-server",
+	},
+	provisioner.WindowsOSType: {
+		executeCommand: "{{.FacterVars}} " +
+			"{{if ne .PuppetBinDir \"\"}}{{.PuppetBinDir}}/{{end}}puppet agent " +
+			"--onetime --no-daemonize " +
+			"{{if ne .PuppetServer \"\"}}--server='{{.PuppetServer}}' {{end}}" +
+			"{{if ne .Options \"\"}}{{.Options}} {{end}}" +
+			"{{if ne .PuppetNode \"\"}}--certname={{.PuppetNode}} {{end}}" +
+			"{{if ne .ClientCertPath \"\"}}--certdir='{{.ClientCertPath}}' {{end}}" +
+			"{{if ne .ClientPrivateKeyPath \"\"}}--privatekeydir='{{.ClientPrivateKeyPath}}' {{end}}" +
+			"--detailed-exitcodes",
+		facterVarsFmt:    "SET \"FACTER_%s=%s\"",
+		facterVarsJoiner: " & ",
+		stagingDir:       "C:/Windows/Temp/packer-puppet-server",
+	},
+}
 
 type Config struct {
 	common.PackerConfig `mapstructure:",squash"`
@@ -19,6 +58,9 @@ type Config struct {
 
 	// The command used to execute Puppet.
 	ExecuteCommand string `mapstructure:"execute_command"`
+
+	// The Guest OS Type (unix or windows)
+	GuestOSType string `mapstructure:"guest_os_type"`
 
 	// Additional facts to set when executing Puppet
 	Facter map[string]string
@@ -45,12 +87,18 @@ type Config struct {
 	// permissions in this directory.
 	StagingDir string `mapstructure:"staging_dir"`
 
+	// The directory that contains the puppet binary.
+	// E.g. if it can't be found on the standard path.
+	PuppetBinDir string `mapstructure:"puppet_bin_dir"`
+
 	// If true, packer will ignore all exit-codes from a puppet run
 	IgnoreExitCodes bool `mapstructure:"ignore_exit_codes"`
 }
 
 type Provisioner struct {
-	config Config
+	config            Config
+	guestOSTypeConfig guestOSTypeConfig
+	guestCommands     *provisioner.GuestCommands
 }
 
 type ExecuteTemplate struct {
@@ -60,6 +108,7 @@ type ExecuteTemplate struct {
 	PuppetNode           string
 	PuppetServer         string
 	Options              string
+	PuppetBinDir         string
 	Sudo                 bool
 }
 
@@ -77,13 +126,35 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 		return err
 	}
 
+	if p.config.GuestOSType == "" {
+		p.config.GuestOSType = provisioner.DefaultOSType
+	}
+	p.config.GuestOSType = strings.ToLower(p.config.GuestOSType)
+
+	var ok bool
+	p.guestOSTypeConfig, ok = guestOSTypeConfigs[p.config.GuestOSType]
+	if !ok {
+		return fmt.Errorf("Invalid guest_os_type: \"%s\"", p.config.GuestOSType)
+	}
+
+	p.guestCommands, err = provisioner.NewGuestCommands(p.config.GuestOSType, !p.config.PreventSudo)
+	if err != nil {
+		return fmt.Errorf("Invalid guest_os_type: \"%s\"", p.config.GuestOSType)
+	}
+
 	if p.config.ExecuteCommand == "" {
-		p.config.ExecuteCommand = p.commandTemplate()
+		p.config.ExecuteCommand = p.guestOSTypeConfig.executeCommand
 	}
 
 	if p.config.StagingDir == "" {
-		p.config.StagingDir = "/tmp/packer-puppet-server"
+		p.config.StagingDir = p.guestOSTypeConfig.stagingDir
 	}
+
+	if p.config.Facter == nil {
+		p.config.Facter = make(map[string]string)
+	}
+	p.config.Facter["packer_build_name"] = p.config.PackerBuildName
+	p.config.Facter["packer_builder_type"] = p.config.PackerBuilderType
 
 	var errs *packer.MultiError
 	if p.config.ClientCertPath != "" {
@@ -149,17 +220,18 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	// Compile the facter variables
 	facterVars := make([]string, 0, len(p.config.Facter))
 	for k, v := range p.config.Facter {
-		facterVars = append(facterVars, fmt.Sprintf("FACTER_%s='%s'", k, v))
+		facterVars = append(facterVars, fmt.Sprintf(p.guestOSTypeConfig.facterVarsFmt, k, v))
 	}
 
 	// Execute Puppet
 	p.config.ctx.Data = &ExecuteTemplate{
-		FacterVars:           strings.Join(facterVars, " "),
+		FacterVars:           strings.Join(facterVars, p.guestOSTypeConfig.facterVarsJoiner),
 		ClientCertPath:       remoteClientCertPath,
 		ClientPrivateKeyPath: remoteClientPrivateKeyPath,
 		PuppetNode:           p.config.PuppetNode,
 		PuppetServer:         p.config.PuppetServer,
 		Options:              p.config.Options,
+		PuppetBinDir:         p.config.PuppetBinDir,
 		Sudo:                 !p.config.PreventSudo,
 	}
 	command, err := interpolate.Render(p.config.ExecuteCommand, &p.config.ctx)
@@ -190,16 +262,23 @@ func (p *Provisioner) Cancel() {
 }
 
 func (p *Provisioner) createDir(ui packer.Ui, comm packer.Communicator, dir string) error {
-	cmd := &packer.RemoteCmd{
-		Command: fmt.Sprintf("mkdir -p '%s'", dir),
-	}
+	ui.Message(fmt.Sprintf("Creating directory: %s", dir))
 
+	cmd := &packer.RemoteCmd{Command: p.guestCommands.CreateDir(dir)}
 	if err := cmd.StartWithUi(comm, ui); err != nil {
 		return err
 	}
-
 	if cmd.ExitStatus != 0 {
-		return fmt.Errorf("Non-zero exit status.")
+		return fmt.Errorf("Non-zero exit status. See output above for more info.")
+	}
+
+	// Chmod the directory to 0777 just so that we can access it as our user
+	cmd = &packer.RemoteCmd{Command: p.guestCommands.Chmod(dir, "0777")}
+	if err := cmd.StartWithUi(comm, ui); err != nil {
+		return err
+	}
+	if cmd.ExitStatus != 0 {
+		return fmt.Errorf("Non-zero exit status. See output above for more info.")
 	}
 
 	return nil
@@ -217,15 +296,4 @@ func (p *Provisioner) uploadDirectory(ui packer.Ui, comm packer.Communicator, ds
 	}
 
 	return comm.UploadDir(dst, src, nil)
-}
-
-func (p *Provisioner) commandTemplate() string {
-	return "{{.FacterVars}} {{if .Sudo}} sudo -E {{end}}" +
-		"puppet agent --onetime --no-daemonize " +
-		"{{if ne .PuppetServer \"\"}}--server='{{.PuppetServer}}' {{end}}" +
-		"{{if ne .Options \"\"}}{{.Options}} {{end}}" +
-		"{{if ne .PuppetNode \"\"}}--certname={{.PuppetNode}} {{end}}" +
-		"{{if ne .ClientCertPath \"\"}}--certdir='{{.ClientCertPath}}' {{end}}" +
-		"{{if ne .ClientPrivateKeyPath \"\"}}--privatekeydir='{{.ClientPrivateKeyPath}}' {{end}}" +
-		"--detailed-exitcodes"
 }

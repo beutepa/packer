@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"log"
 
+	vboxcommon "github.com/hashicorp/packer/builder/virtualbox/common"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	vboxcommon "github.com/mitchellh/packer/builder/virtualbox/common"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/packer"
 )
 
 // Builder implements packer.Builder and builds the actual VirtualBox
@@ -70,9 +70,17 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 			GuestAdditionsSHA256: b.config.GuestAdditionsSHA256,
 			Ctx:                  b.config.ctx,
 		},
+		&common.StepDownload{
+			Checksum:     b.config.Checksum,
+			ChecksumType: b.config.ChecksumType,
+			Description:  "OVF/OVA",
+			Extension:    "ova",
+			ResultKey:    "vm_path",
+			TargetPath:   b.config.TargetPath,
+			Url:          []string{b.config.SourcePath},
+		},
 		&StepImport{
 			Name:        b.config.VMName,
-			SourcePath:  b.config.SourcePath,
 			ImportFlags: b.config.ImportFlags,
 		},
 		&vboxcommon.StepAttachGuestAdditions{
@@ -108,9 +116,10 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 			Host:      vboxcommon.CommHost(b.config.SSHConfig.Comm.SSHHost),
 			SSHConfig: vboxcommon.SSHConfigFunc(b.config.SSHConfig),
 			SSHPort:   vboxcommon.SSHPort,
+			WinRMPort: vboxcommon.SSHPort,
 		},
 		&vboxcommon.StepUploadVersion{
-			Path: b.config.VBoxVersionFile,
+			Path: *b.config.VBoxVersionFile,
 		},
 		&vboxcommon.StepUploadGuestAdditions{
 			GuestAdditionsMode: b.config.GuestAdditionsMode,
@@ -133,6 +142,7 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 			OutputDir:      b.config.OutputDir,
 			ExportOpts:     b.config.ExportOpts.ExportOpts,
 			SkipNatMapping: b.config.SSHSkipNatMapping,
+			SkipExport:     b.config.SkipExport,
 		},
 	}
 
